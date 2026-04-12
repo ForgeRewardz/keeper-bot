@@ -137,58 +137,6 @@ pub async fn get_user_total_points(
     Ok(row.map(|r| r.get("total_points")))
 }
 
-/// Idempotent point deduction keyed on mint_attempt_pda.
-/// Returns true if deduction happened, false if already processed.
-pub async fn deduct_user_points(
-    pool: &PgPool,
-    wallet: &str,
-    amount: i64,
-    mint_attempt_pda: &str,
-) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-
-    // Check if already processed.
-    let existing: Option<PgRow> =
-        sqlx::query("SELECT id FROM point_deductions WHERE mint_attempt_pda = $1")
-            .bind(mint_attempt_pda)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-    if existing.is_some() {
-        tx.commit().await?;
-        return Ok(false);
-    }
-
-    // Deduct points — verify the UPDATE actually affected a row.
-    let result = sqlx::query(
-        "UPDATE users SET total_points = total_points - $1 WHERE wallet_address = $2 AND total_points >= $1",
-    )
-    .bind(amount)
-    .bind(wallet)
-    .execute(&mut *tx)
-    .await?;
-
-    if result.rows_affected() == 0 {
-        // User doesn't exist or has insufficient points — do NOT mark as processed
-        // so the burn watcher can retry on the next poll.
-        tx.rollback().await?;
-        return Ok(false);
-    }
-
-    // Record deduction.
-    sqlx::query(
-        "INSERT INTO point_deductions (wallet_address, amount, mint_attempt_pda) VALUES ($1, $2, $3)",
-    )
-    .bind(wallet)
-    .bind(amount)
-    .bind(mint_attempt_pda)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-    Ok(true)
-}
-
 // ── Hex helpers ─────────────────────────────────────────────
 
 fn hex_encode(bytes: &[u8]) -> String {

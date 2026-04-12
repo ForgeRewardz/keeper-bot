@@ -3,9 +3,9 @@
 // ============================================================
 
 mod api;
-mod burn_watcher;
 mod config;
 mod db;
+mod game_loop;
 mod merkle;
 mod publisher;
 mod rental;
@@ -27,7 +27,7 @@ struct Cli {
 enum Command {
     /// Run the HTTP API server only
     ServeApi,
-    /// Run cron jobs only (publisher, rental, subscriptions, burn watcher)
+    /// Run cron jobs only (publisher, rental, subscriptions, mining game loop)
     RunCrons,
     /// Run both API server and cron jobs (default)
     Full,
@@ -101,9 +101,7 @@ async fn run_api(
         .unwrap_or_else(|e| panic!("Failed to bind to {}: {e}", config.api_listen_addr));
 
     info!("API server listening on {}", config.api_listen_addr);
-    axum::serve(listener, app)
-        .await
-        .expect("API server error");
+    axum::serve(listener, app).await.expect("API server error");
 }
 
 fn run_crons(
@@ -136,11 +134,11 @@ fn run_crons(
         config.clone(),
     );
 
-    // Burn watcher cron (poll every 30 seconds — aggressive for ephemeral accounts).
-    burn_watcher::start_burn_watcher_cron(
-        30,
-        pool.clone(),
+    // Mining game loop cron.
+    game_loop::start_game_loop_cron(
+        config.game_loop_interval_secs,
         config.solana_rpc_url.clone(),
+        keypair.clone(),
         config.program_id,
     );
 }

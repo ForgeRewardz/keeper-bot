@@ -15,6 +15,7 @@ pub struct Config {
     pub point_root_interval_secs: u64,
     pub rental_settle_interval_secs: u64,
     pub subscription_poll_interval_secs: u64,
+    pub game_loop_interval_secs: u64,
     pub points_request_ttl_seconds: i64,
     pub points_receipt_ttl_seconds: i64,
     pub points_cors_origins: String,
@@ -55,6 +56,11 @@ pub fn load() -> (Config, Keypair) {
         .parse()
         .expect("SUBSCRIPTION_POLL_INTERVAL_SECS must be a u64");
 
+    let game_loop_interval_secs: u64 = std::env::var("GAME_LOOP_INTERVAL_SECS")
+        .unwrap_or_else(|_| "15".to_string())
+        .parse()
+        .expect("GAME_LOOP_INTERVAL_SECS must be a u64");
+
     let points_request_ttl_seconds: i64 = std::env::var("POINTS_REQUEST_TTL_SECONDS")
         .unwrap_or_else(|_| "300".to_string())
         .parse()
@@ -84,6 +90,7 @@ pub fn load() -> (Config, Keypair) {
         point_root_interval_secs,
         rental_settle_interval_secs,
         subscription_poll_interval_secs,
+        game_loop_interval_secs,
         points_request_ttl_seconds,
         points_receipt_ttl_seconds,
         points_cors_origins,

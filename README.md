@@ -1,13 +1,13 @@
 # mvp-keeper-bot
 
-Off-chain keeper service for the REWARDZ protocol. Publishes Merkle roots on-chain, signs point-sync receipts, settles rentals, executes subscriptions, and watches for burn-to-mint point deductions.
+Off-chain keeper service for the REWARDZ protocol. Publishes Merkle roots on-chain, signs point-sync receipts, settles rentals, executes subscriptions, and cranks the mining game loop.
 
 ## Architecture
 
 The keeper bot runs as a single binary with three modes:
 
 - **serve-api** — HTTP server (receipt signing, bootstrap awards, health check)
-- **run-crons** — Background jobs (root publisher, rental settlement, subscription executor, burn watcher)
+- **run-crons** — Background jobs (root publisher, rental settlement, subscription executor, mining game loop)
 - **full** — Both API and crons (default)
 
 ### Components
@@ -19,7 +19,7 @@ The keeper bot runs as a single binary with three modes:
 | `api.rs`           | Receipt signing + bootstrap award HTTP endpoints  |
 | `rental.rs`        | Settles active rental agreements weekly           |
 | `subscriptions.rs` | Polls and executes due subscriptions              |
-| `burn_watcher.rs`  | Deducts points for burn-to-mint attempts          |
+| `game_loop.rs`     | Starts and settles mining rounds                  |
 
 ## Environment Variables
 
@@ -35,6 +35,7 @@ The keeper bot runs as a single binary with three modes:
 | `POINT_ROOT_INTERVAL_SECS`        | No       | `28800` (8h)            | Root publish interval        |
 | `RENTAL_SETTLE_INTERVAL_SECS`     | No       | `604800` (1 week)       | Rental settlement interval   |
 | `SUBSCRIPTION_POLL_INTERVAL_SECS` | No       | `60`                    | Subscription poll interval   |
+| `GAME_LOOP_INTERVAL_SECS`         | No       | `15`                    | Mining game crank interval   |
 | `POINTS_REQUEST_TTL_SECONDS`      | No       | `300`                   | Receipt request TTL          |
 | `POINTS_RECEIPT_TTL_SECONDS`      | No       | `600`                   | Signed receipt TTL           |
 | `POINTS_CORS_ORIGINS`             | No       | `*`                     | CORS allowed origins         |
@@ -70,6 +71,16 @@ docker compose up -d
 | POST   | `/sign-receipt`    | Sign a point-sync receipt         |
 | POST   | `/bootstrap-award` | Award initial points to new users |
 | GET    | `/healthz`         | Health check                      |
+
+## Mining Game Loop
+
+The keeper polls the game PDAs and submits permissionless round transactions:
+
+- `start_round` when no round exists or the previous round is settled and past intermission
+- `settle_round` after `end_slot + intermission_slots`
+- skipped settlement when a round has fewer than 2 players
+
+See [`GAME_LOOP.md`](./GAME_LOOP.md) for account lists, timing, and manual fallback notes.
 
 ## Merkle Tree
 
