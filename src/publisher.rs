@@ -29,7 +29,7 @@ const CONFIG_SEED: &[u8] = b"config";
 /// Instruction discriminator for set_point_root.
 /// This is determined by the on-chain program's instruction dispatch.
 /// Update this value to match the actual discriminator in the deployed program.
-const SET_POINT_ROOT_DISCRIMINATOR: u8 = 7;
+const SET_POINT_ROOT_DISCRIMINATOR: u8 = 15;
 
 /// Publish the Merkle root on-chain.
 pub async fn publish_root(
