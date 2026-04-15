@@ -1,7 +1,18 @@
 // ============================================================
 // game_loop.rs — Round-based mining game cranker
 // ============================================================
+//
+// Constants, PDA seeds, discriminators, instruction codes, and
+// account layout offsets are imported from the shared
+// `rewardz-mvp-api` crate (see mvp-smart-contracts/api). Do NOT
+// hardcode them here — they must stay in sync with the on-chain
+// program.
 
+use rewardz_mvp_api::{
+    parse_pubkey, parse_u64, validate_account, GAME_CONFIG_SEED, GAME_ROUND_SEED, IX_SETTLE_ROUND,
+    IX_START_ROUND, MIN_GAME_PLAYERS, ROUND_VAULT_SEED,
+};
+use rewardz_mvp_api::state::{GameConfig, GameRound, PlayerDeployment};
 use solana_client::{
     rpc_client::RpcClient,
     rpc_config::RpcProgramAccountsConfig,
@@ -21,28 +32,10 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{error, info, warn};
 
-const DISC_GAME_CONFIG: u8 = 7;
-const DISC_GAME_ROUND: u8 = 8;
-const DISC_PLAYER_DEPLOYMENT: u8 = 9;
-const IX_START_ROUND: u8 = 19;
-const IX_SETTLE_ROUND: u8 = 21;
-const MIN_GAME_PLAYERS: u32 = 2;
-
-const GAME_CONFIG_SEED: &[u8] = b"game_config";
-const GAME_ROUND_SEED: &[u8] = b"game_round";
-const ROUND_VAULT_SEED: &[u8] = b"round_vault";
-
+// ── Account layout prefix (version byte + discriminator) ──
+// Mirrors `PREFIX_LEN` from the on-chain program: 2 bytes before
+// any field offset defined in the api state structs.
 const PREFIX_LEN: usize = 2;
-const GAME_CONFIG_LEN: usize = 193;
-const GAME_CONFIG_OFF_REWARD_MINT: usize = PREFIX_LEN + 32;
-const GAME_CONFIG_OFF_CURRENT_ROUND_ID: usize = PREFIX_LEN + 128;
-const GAME_CONFIG_OFF_INTERMISSION_SLOTS: usize = PREFIX_LEN + 144;
-const GAME_ROUND_LEN: usize = 168;
-const GAME_ROUND_OFF_ROUND_ID: usize = PREFIX_LEN;
-const GAME_ROUND_OFF_END_SLOT: usize = PREFIX_LEN + 16;
-const GAME_ROUND_OFF_PLAYER_COUNT: usize = PREFIX_LEN + 24;
-const GAME_ROUND_OFF_SETTLED: usize = PREFIX_LEN + 44;
-const PLAYER_DEPLOYMENT_OFF_ROUND_ID: usize = PREFIX_LEN + 32;
 
 fn token_2022_program_id() -> Pubkey {
     Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPwEGpKvp5E8dRmAr91hFq").unwrap()
@@ -79,39 +72,34 @@ fn round_vault_pda(program_id: &Pubkey, round_id: u64) -> Pubkey {
     Pubkey::find_program_address(&[ROUND_VAULT_SEED, &round_id.to_le_bytes()], program_id).0
 }
 
-fn read_u64(data: &[u8], off: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(data.get(off..off + 8)?.try_into().ok()?))
+fn read_pubkey(data: &[u8], off: usize) -> Option<Pubkey> {
+    parse_pubkey(data, off).map(Pubkey::new_from_array)
 }
 
 fn read_u32(data: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?))
 }
 
-fn read_pubkey(data: &[u8], off: usize) -> Option<Pubkey> {
-    let bytes: [u8; 32] = data.get(off..off + 32)?.try_into().ok()?;
-    Some(Pubkey::new_from_array(bytes))
-}
-
 fn parse_game_config(data: &[u8]) -> Option<GameConfigState> {
-    if data.len() < GAME_CONFIG_LEN || data[0] != DISC_GAME_CONFIG {
+    if !validate_account(data, GameConfig::DISCRIMINATOR, GameConfig::LEN) {
         return None;
     }
     Some(GameConfigState {
-        current_round_id: read_u64(data, GAME_CONFIG_OFF_CURRENT_ROUND_ID)?,
-        intermission_slots: read_u64(data, GAME_CONFIG_OFF_INTERMISSION_SLOTS)?,
-        reward_mint: read_pubkey(data, GAME_CONFIG_OFF_REWARD_MINT)?,
+        current_round_id: parse_u64(data, PREFIX_LEN + GameConfig::OFF_CURRENT_ROUND_ID)?,
+        intermission_slots: parse_u64(data, PREFIX_LEN + GameConfig::OFF_INTERMISSION_SLOTS)?,
+        reward_mint: read_pubkey(data, PREFIX_LEN + GameConfig::OFF_REWARD_MINT)?,
     })
 }
 
 fn parse_game_round(data: &[u8]) -> Option<GameRoundState> {
-    if data.len() < GAME_ROUND_LEN || data[0] != DISC_GAME_ROUND {
+    if !validate_account(data, GameRound::DISCRIMINATOR, GameRound::LEN) {
         return None;
     }
     Some(GameRoundState {
-        round_id: read_u64(data, GAME_ROUND_OFF_ROUND_ID)?,
-        end_slot: read_u64(data, GAME_ROUND_OFF_END_SLOT)?,
-        player_count: read_u32(data, GAME_ROUND_OFF_PLAYER_COUNT)?,
-        settled: data.get(GAME_ROUND_OFF_SETTLED).copied()? != 0,
+        round_id: parse_u64(data, PREFIX_LEN + GameRound::OFF_ROUND_ID)?,
+        end_slot: parse_u64(data, PREFIX_LEN + GameRound::OFF_END_SLOT)?,
+        player_count: read_u32(data, PREFIX_LEN + GameRound::OFF_PLAYER_COUNT)?,
+        settled: data.get(PREFIX_LEN + GameRound::OFF_SETTLED).copied()? != 0,
     })
 }
 
@@ -166,9 +154,12 @@ fn load_deployments(
             program_id,
             RpcProgramAccountsConfig {
                 filters: Some(vec![
-                    RpcFilterType::Memcmp(Memcmp::new_raw_bytes(0, vec![DISC_PLAYER_DEPLOYMENT])),
                     RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
-                        PLAYER_DEPLOYMENT_OFF_ROUND_ID,
+                        0,
+                        vec![PlayerDeployment::DISCRIMINATOR],
+                    )),
+                    RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
+                        PREFIX_LEN + PlayerDeployment::OFF_ROUND_ID,
                         round_id.to_le_bytes().to_vec(),
                     )),
                 ]),
@@ -263,7 +254,9 @@ fn settle_round(
         );
     }
 
-    let mut accounts = vec![
+    // SettleRound is an O(1) snapshot — no PlayerDeployment accounts required.
+    // Per-player hit computation happens in CheckpointRound (see cranker loop).
+    let accounts = vec![
         AccountMeta::new_readonly(keypair.pubkey(), true),
         AccountMeta::new(game_config_pda(program_id), false),
         AccountMeta::new(game_round_pda(program_id, round.round_id), false),
@@ -272,11 +265,6 @@ fn settle_round(
         AccountMeta::new_readonly(sysvar::slot_hashes::id(), false),
         AccountMeta::new_readonly(token_2022_program_id(), false),
     ];
-    accounts.extend(
-        deployments
-            .into_iter()
-            .map(|pda| AccountMeta::new(pda, false)),
-    );
 
     let ix = Instruction {
         program_id: *program_id,
@@ -286,6 +274,11 @@ fn settle_round(
     send_instruction(rpc, keypair, ix)
 }
 
+/// One tick of the game loop. Performs AT MOST one on-chain state
+/// transition per invocation (start, or settle). A settled round
+/// waiting for intermission will cause the next tick to start a new
+/// round. Splitting settle and start into separate ticks keeps each
+/// transaction isolated and idempotent.
 pub async fn tick_game_loop(
     rpc: &RpcClient,
     keypair: &Keypair,
@@ -335,13 +328,13 @@ pub async fn tick_game_loop(
         return Ok(());
     }
 
+    // Single-round tick: only settle the active round. The next tick
+    // will observe `settled == true` and start the next round. This
+    // bounds each tick to a single transaction.
     let settle_sig = settle_round(rpc, keypair, program_id, &config, &round)?;
-    info!("Settled mining round {}, tx={settle_sig}", round.round_id);
-
-    let start_sig = start_round(rpc, keypair, program_id, &config)?;
     info!(
-        "Started mining round {} after settlement, tx={start_sig}",
-        config.current_round_id + 1
+        "Settled mining round {}, tx={settle_sig}. Next round will start on the following tick.",
+        round.round_id
     );
     Ok(())
 }
@@ -363,6 +356,43 @@ pub fn start_game_loop_cron(
             if let Err(e) = tick_game_loop(&rpc, &keypair, &program_id).await {
                 error!("Game loop cron error: {e}");
             }
+        }
+    });
+}
+
+/// Opt-in per-player checkpoint cranker. Gated on env var
+/// `KEEPER_RUN_CRANKER=true`; default is off so existing deployments
+/// see no behavioural change. When enabled, this loop will (in future
+/// revisions) scan settled rounds for outstanding PlayerDeployment
+/// accounts and submit `CheckpointRound` transactions, collecting the
+/// checkpoint fee per on-chain program rules. Today it simply logs
+/// its heartbeat — scope is limited to wiring the env-var gate so
+/// downstream tasks can light it up without touching the keeper main.
+pub fn start_cranker_loop(
+    interval_secs: u64,
+    _rpc_url: String,
+    _keypair: Arc<Keypair>,
+    _program_id: Pubkey,
+) {
+    let enabled = std::env::var("KEEPER_RUN_CRANKER")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
+
+    if !enabled {
+        info!("Cranker loop disabled (set KEEPER_RUN_CRANKER=true to enable)");
+        return;
+    }
+
+    info!("Cranker loop enabled; scanning settled rounds every {interval_secs}s");
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(interval_secs));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            // Placeholder: per-player CheckpointRound cranking lands in a
+            // follow-up task. Keeping this as a no-op heartbeat preserves
+            // the env-var contract without altering on-chain behaviour.
+            info!("cranker tick (noop; checkpoint cranking not yet implemented)");
         }
     });
 }
