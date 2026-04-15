@@ -42,3 +42,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # HTTP client (for calling API service)
 reqwest = { version = "0.12", features = ["json"] }
+
+# Shared on-chain constants, PDA seeds, and account layouts
+rewardz-mvp-api = { path = "../mvp-smart-contracts/api" }

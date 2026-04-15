@@ -141,4 +141,13 @@ fn run_crons(
         keypair.clone(),
         config.program_id,
     );
+
+    // Optional per-player checkpoint cranker (off by default).
+    // Set KEEPER_RUN_CRANKER=true to enable.
+    game_loop::start_cranker_loop(
+        config.game_loop_interval_secs,
+        config.solana_rpc_url.clone(),
+        keypair.clone(),
+        config.program_id,
+    );
 }
