@@ -7,6 +7,15 @@
 // `rewardz-mvp-api` crate (see mvp-smart-contracts/api). Do NOT
 // hardcode them here — they must stay in sync with the on-chain
 // program.
+//
+// IDEMPOTENCY: `start_round` is protected by a preflight guard
+// (see `should_skip_start_round` below). setup.sh's bootstrap
+// step hands off to the keeper via `cargo run -- full`, and the
+// first cron tick submits `start_round` when `current_round_id
+// == 0`. If the keeper is restarted or the bootstrap is re-run
+// before the first round is settled, repeated invocations must
+// be safe no-ops rather than duplicate transactions. TODO-0018
+// task 52a owns this contract.
 
 use rewardz_mvp_api::{
     parse_pubkey, parse_u64, validate_account, GAME_CONFIG_SEED, GAME_ROUND_SEED, IX_SETTLE_ROUND,
@@ -190,16 +199,79 @@ fn send_instruction(
     Ok(rpc.send_and_confirm_transaction(&tx)?)
 }
 
+// ── Idempotency guard for start_round ─────────────────────────
+//
+// `setup.sh` hands off to the keeper via `cargo run -- full`, and the
+// very first `tick_game_loop` invocation detects `current_round_id == 0`
+// and submits a `start_round` transaction. Any repeated bootstrap
+// (re-running setup, restarting the keeper mid-round, a cron tick that
+// races a prior tick whose tx has not yet landed in the caller's RPC
+// view) must be a safe no-op instead of producing a duplicate
+// transaction that the on-chain program would reject.
+//
+// The pure predicate below is kept separate from the RPC-touching
+// wrapper so it can be unit-tested without a live validator.
+//
+// Contract: if the *target* round PDA (i.e. the one `start_round` is
+// about to create, at `current_round_id + 1`) already exists and is
+// not yet `settled`, the round is considered active and we skip.
+// Any other state (PDA missing, or present but settled) falls through
+// to normal tx submission.
+fn should_skip_start_round(round_state: Option<&GameRoundState>) -> bool {
+    match round_state {
+        Some(round) => !round.settled,
+        None => false,
+    }
+}
+
+/// Outcome of a `start_round` attempt.
+///
+/// `Submitted` carries the on-chain signature for the freshly opened
+/// round. `Skipped` means the guard fired — the target round PDA was
+/// already active, so no transaction was sent. Callers log differently
+/// in each case so operators can distinguish bootstrap races from
+/// genuine round openings.
+#[derive(Debug)]
+enum StartRoundOutcome {
+    Submitted(Signature),
+    Skipped { round_id: u64 },
+}
+
 fn start_round(
     rpc: &RpcClient,
     keypair: &Keypair,
     program_id: &Pubkey,
     config: &GameConfigState,
-) -> Result<Signature, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<StartRoundOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let next_round_id = config
         .current_round_id
         .checked_add(1)
         .ok_or("round id overflow")?;
+
+    // Preflight: one free account read to detect "round already active".
+    // If the target PDA exists and is not settled, another tick (or an
+    // earlier bootstrap attempt) beat us to it. Silently no-op.
+    let existing = load_game_round(rpc, program_id, next_round_id)?;
+    if should_skip_start_round(existing.as_ref()) {
+        info!(
+            "start_round skipped: round {next_round_id} already active (idempotency guard)"
+        );
+        return Ok(StartRoundOutcome::Skipped {
+            round_id: next_round_id,
+        });
+    }
+
+    let sig = submit_start_round(rpc, keypair, program_id, config, next_round_id)?;
+    Ok(StartRoundOutcome::Submitted(sig))
+}
+
+fn submit_start_round(
+    rpc: &RpcClient,
+    keypair: &Keypair,
+    program_id: &Pubkey,
+    config: &GameConfigState,
+    next_round_id: u64,
+) -> Result<Signature, Box<dyn std::error::Error + Send + Sync>> {
     let game_config = game_config_pda(program_id);
     let game_round = game_round_pda(program_id, next_round_id);
     let previous_round = if config.current_round_id > 0 {
@@ -290,8 +362,16 @@ pub async fn tick_game_loop(
     let current_slot = rpc.get_slot()?;
 
     if config.current_round_id == 0 {
-        let sig = start_round(rpc, keypair, program_id, &config)?;
-        info!("Started first mining round, tx={sig}");
+        match start_round(rpc, keypair, program_id, &config)? {
+            StartRoundOutcome::Submitted(sig) => {
+                info!("Started first mining round, tx={sig}");
+            }
+            StartRoundOutcome::Skipped { round_id } => {
+                info!(
+                    "First mining round {round_id} already active; bootstrap no-op"
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -305,12 +385,21 @@ pub async fn tick_game_loop(
 
     if round.settled {
         if current_slot >= crank_slot {
-            let sig = start_round(rpc, keypair, program_id, &config)?;
-            info!(
-                "Started mining round {} after settled round {}, tx={sig}",
-                config.current_round_id + 1,
-                round.round_id
-            );
+            match start_round(rpc, keypair, program_id, &config)? {
+                StartRoundOutcome::Submitted(sig) => {
+                    info!(
+                        "Started mining round {} after settled round {}, tx={sig}",
+                        config.current_round_id + 1,
+                        round.round_id
+                    );
+                }
+                StartRoundOutcome::Skipped { round_id } => {
+                    info!(
+                        "Round {round_id} already active; skipping redundant start_round after settled round {}",
+                        round.round_id
+                    );
+                }
+            }
         } else {
             info!(
                 "Round {} settled; next round opens at slot {} (current {})",
@@ -395,4 +484,72 @@ pub fn start_cranker_loop(
             info!("cranker tick (noop; checkpoint cranking not yet implemented)");
         }
     });
+}
+
+// ============================================================
+// Tests
+// ============================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_round(round_id: u64, settled: bool) -> GameRoundState {
+        GameRoundState {
+            round_id,
+            end_slot: 100,
+            player_count: 0,
+            settled,
+        }
+    }
+
+    #[test]
+    fn should_skip_when_target_round_active() {
+        // Round PDA exists and is NOT settled → start_round must be a no-op.
+        // This is the bootstrap-race case: setup.sh handoff → keeper cron
+        // observes current_round_id==0 → submits start_round → before the
+        // tx is visible, a second tick (or restart) tries again.
+        let active = make_round(1, false);
+        assert!(
+            should_skip_start_round(Some(&active)),
+            "active round must trigger the idempotency guard"
+        );
+    }
+
+    #[test]
+    fn should_not_skip_when_target_round_absent() {
+        // Round PDA does not exist yet (typical first-ever bootstrap).
+        // Must fall through to tx submission.
+        assert!(
+            !should_skip_start_round(None),
+            "missing round PDA must allow start_round to submit"
+        );
+    }
+
+    #[test]
+    fn should_not_skip_when_target_round_settled() {
+        // Round PDA exists AND is settled (i.e. the round that just
+        // finished). `start_round` with next_round_id pointing at a
+        // settled PDA would be a pathological reuse — in practice the
+        // caller passes next_round_id = current_round_id + 1, so the
+        // PDA shouldn't exist at all. Defensive: if it does exist and
+        // is settled, we still allow submission to surface the on-chain
+        // error rather than silently swallowing it.
+        let done = make_round(1, true);
+        assert!(
+            !should_skip_start_round(Some(&done)),
+            "settled round must not trigger the guard"
+        );
+    }
+
+    #[test]
+    fn start_round_outcome_reports_skip_round_id() {
+        // Smoke test for the outcome enum — ensures `Skipped` carries
+        // the round id so log lines can identify which round was
+        // already active.
+        let outcome = StartRoundOutcome::Skipped { round_id: 42 };
+        match outcome {
+            StartRoundOutcome::Skipped { round_id } => assert_eq!(round_id, 42),
+            StartRoundOutcome::Submitted(_) => panic!("expected Skipped variant"),
+        }
+    }
 }
