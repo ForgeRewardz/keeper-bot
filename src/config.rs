@@ -16,6 +16,14 @@ pub struct Config {
     pub rental_settle_interval_secs: u64,
     pub subscription_poll_interval_secs: u64,
     pub game_loop_interval_secs: u64,
+    pub capacity_reset_interval_secs: u64,
+    pub quality_score_interval_secs: u64,
+    pub milestone_processor_interval_secs: u64,
+    pub anti_abuse_interval_secs: u64,
+    pub visibility_tick_interval_secs: u64,
+    pub leaderboard_interval_secs: u64,
+    pub stake_watcher_interval_secs: u64,
+    pub rewardz_publish_interval_secs: u64,
     pub points_request_ttl_seconds: i64,
     pub points_receipt_ttl_seconds: i64,
     pub points_cors_origins: String,
@@ -61,6 +69,64 @@ pub fn load() -> (Config, Keypair) {
         .parse()
         .expect("GAME_LOOP_INTERVAL_SECS must be a u64");
 
+    // League crons. Defaults chosen to match league-config.md cadence notes:
+    //   - capacity-reset: hourly poll of an elapsed-window predicate (the
+    //     actual weekly cadence is per-protocol via capacity_window_start).
+    //   - quality-score:  hourly recompute per league-config §quality-score.
+    //   - milestone-processor: every 5 minutes (task 15 spec).
+    let capacity_reset_interval_secs: u64 = std::env::var("CAPACITY_RESET_INTERVAL_SECS")
+        .unwrap_or_else(|_| "3600".to_string())
+        .parse()
+        .expect("CAPACITY_RESET_INTERVAL_SECS must be a u64");
+
+    let quality_score_interval_secs: u64 = std::env::var("QUALITY_SCORE_INTERVAL_SECS")
+        .unwrap_or_else(|_| "3600".to_string())
+        .parse()
+        .expect("QUALITY_SCORE_INTERVAL_SECS must be a u64");
+
+    let milestone_processor_interval_secs: u64 = std::env::var("MILESTONE_PROCESSOR_INTERVAL_SECS")
+        .unwrap_or_else(|_| "300".to_string())
+        .parse()
+        .expect("MILESTONE_PROCESSOR_INTERVAL_SECS must be a u64");
+
+    // Anti-abuse scanner: hourly. Cheap aggregate queries; safe to
+    // poll faster if we ever want quicker freeze response.
+    let anti_abuse_interval_secs: u64 = std::env::var("ANTI_ABUSE_INTERVAL_SECS")
+        .unwrap_or_else(|_| "3600".to_string())
+        .parse()
+        .expect("ANTI_ABUSE_INTERVAL_SECS must be a u64");
+
+    // Visibility state machine: 15 minutes (task 14 spec).
+    let visibility_tick_interval_secs: u64 = std::env::var("VISIBILITY_TICK_INTERVAL_SECS")
+        .unwrap_or_else(|_| "900".to_string())
+        .parse()
+        .expect("VISIBILITY_TICK_INTERVAL_SECS must be a u64");
+
+    // Leaderboard snapshot: daily (task 17 spec). Snapshot is keyed
+    // on CURRENT_DATE so the cadence can be shorter for testing
+    // without producing duplicate rows.
+    let leaderboard_interval_secs: u64 = std::env::var("LEADERBOARD_INTERVAL_SECS")
+        .unwrap_or_else(|_| "86400".to_string())
+        .parse()
+        .expect("LEADERBOARD_INTERVAL_SECS must be a u64");
+
+    // Stake watcher (task 16a): polls on-chain ProtocolStake PDAs and
+    // mirrors active_stake into the DB. 60s default — unlock needs to
+    // show up inside a console walkthrough but doesn't require sub-slot
+    // latency. Override via STAKE_WATCHER_INTERVAL_SECS for rehearsals.
+    let stake_watcher_interval_secs: u64 = std::env::var("STAKE_WATCHER_INTERVAL_SECS")
+        .unwrap_or_else(|_| "60".to_string())
+        .parse()
+        .expect("STAKE_WATCHER_INTERVAL_SECS must be a u64");
+
+    // Rewardz publisher cron (task 33). Default matches
+    // LeagueConfig.rewardz_publish_interval_secs (3600s devnet); override
+    // via REWARDZ_PUBLISH_INTERVAL_SECS for rehearsal or tests.
+    let rewardz_publish_interval_secs: u64 = std::env::var("REWARDZ_PUBLISH_INTERVAL_SECS")
+        .unwrap_or_else(|_| "3600".to_string())
+        .parse()
+        .expect("REWARDZ_PUBLISH_INTERVAL_SECS must be a u64");
+
     let points_request_ttl_seconds: i64 = std::env::var("POINTS_REQUEST_TTL_SECONDS")
         .unwrap_or_else(|_| "300".to_string())
         .parse()
@@ -91,6 +157,14 @@ pub fn load() -> (Config, Keypair) {
         rental_settle_interval_secs,
         subscription_poll_interval_secs,
         game_loop_interval_secs,
+        capacity_reset_interval_secs,
+        quality_score_interval_secs,
+        milestone_processor_interval_secs,
+        anti_abuse_interval_secs,
+        visibility_tick_interval_secs,
+        leaderboard_interval_secs,
+        stake_watcher_interval_secs,
+        rewardz_publish_interval_secs,
         points_request_ttl_seconds,
         points_receipt_ttl_seconds,
         points_cors_origins,

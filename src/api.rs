@@ -3,7 +3,7 @@
 // ============================================================
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -22,6 +22,8 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
 use crate::db;
+use crate::rewardz_merkle::build_rewardz_tree;
+use crate::rewardz_publisher::read_onchain_rewardz_root;
 
 // ── Shared state ────────────────────────────────────────────
 
@@ -33,6 +35,11 @@ pub struct AppState {
     pub program_id: Pubkey,
     pub points_request_ttl_seconds: i64,
     pub points_receipt_ttl_seconds: i64,
+    /// Used by `/rewardz/proof/:authority` to compute the
+    /// `valid_until_next_publish_at` hint returned to clients. Mirrors
+    /// the cron cadence so the window can never outlast the next
+    /// publish — a conservative upper bound, not a guarantee.
+    pub rewardz_publish_interval_secs: i64,
 }
 
 // ── Request / Response types ────────────────────────────────
@@ -86,6 +93,26 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+/// Response body for `GET /rewardz/proof/:authority`. Shape mirrors
+/// `rewardz-claim-design.md` §Keeper REST endpoint exactly — any field
+/// rename here MUST land in the SDK's `ProtocolAdapter.claimRewardz`
+/// consumer in lockstep or the round-trip test breaks.
+#[derive(Debug, Serialize)]
+pub struct RewardzProofResponse {
+    pub cumulative_amount: u64,
+    pub epoch: u64,
+    /// Hex-encoded (0x-prefixed) sibling hashes, ordered leaf → root.
+    pub proof: Vec<String>,
+    /// Hex-encoded (0x-prefixed) Keccak256 root — matches the on-chain
+    /// `RewardzRoot.root` at the moment this response is produced.
+    pub root: String,
+    /// Upper bound on when the client should consider the proof stale
+    /// and re-fetch. Conservative (= now + publish interval); the
+    /// actual staleness boundary is the next successful `set_rewardz_root`
+    /// tx, which may fire sooner under operator-initiated rehearsal.
+    pub valid_until_next_publish_at: String,
+}
+
 // ── Router ──────────────────────────────────────────────────
 
 pub fn create_router(state: AppState, cors_origins: &str) -> Router {
@@ -110,6 +137,7 @@ pub fn create_router(state: AppState, cors_origins: &str) -> Router {
     Router::new()
         .route("/sign-receipt", post(sign_receipt))
         .route("/bootstrap-award", post(bootstrap_award))
+        .route("/rewardz/proof/:authority", get(get_rewardz_proof))
         .route("/healthz", get(healthz))
         .layer(cors)
         .with_state(state)
@@ -416,6 +444,206 @@ async fn bootstrap_award(
     Ok(Json(BootstrapAwardResponse {
         success: true,
         message: format!("Awarded {bootstrap_amount} bootstrap points"),
+    }))
+}
+
+// ── GET /rewardz/proof/:authority ───────────────────────────
+
+/// Return the current Merkle proof for a protocol's cumulative Rewardz
+/// earnings. The response is consumed by the SDK's
+/// `ProtocolAdapter.claimRewardz()` helper — its shape is pinned by
+/// `rewardz-claim-design.md` §Keeper REST endpoint.
+///
+/// Design contract: the returned `root` MUST equal the on-chain
+/// `RewardzRoot.root` at the moment of response, because the
+/// `claim_rewardz` IX validates the proof against that exact byte
+/// string. We therefore:
+///   1. Read the on-chain root (single source of truth for what
+///      protocols can claim right now).
+///   2. Rebuild the tree from current DB state using the same SQL +
+///      filter the publisher uses (reproducibility invariant per
+///      `rewardz_merkle.rs::test_deterministic_root`).
+///   3. Reject with 503 if the rebuilt root doesn't match the on-chain
+///      root — that means new `rewardz_earnings` rows have landed
+///      since the last publish and the proof we would produce cannot
+///      verify on-chain. A subsequent publish closes the gap.
+///
+/// Persisting proofs in DB at publish time (task 35) will close the
+/// 503 window; documented here so the limitation is visible to
+/// downstream consumers during the interim.
+async fn get_rewardz_proof(
+    State(state): State<AppState>,
+    Path(authority_str): Path<String>,
+) -> Result<Json<RewardzProofResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // 1. Parse authority. Keep the parse before any RPC/DB work so
+    //    clearly-bad input returns 400 without burning a round trip.
+    let target = Pubkey::from_str(&authority_str).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid authority pubkey: {e}"),
+            }),
+        )
+    })?;
+
+    // 2. Read the on-chain RewardzRoot via spawn_blocking — RpcClient
+    //    is sync and would otherwise stall the Tokio worker.
+    let rpc_url = state.rpc_url.clone();
+    let program_id = state.program_id;
+    let onchain = tokio::task::spawn_blocking(move || {
+        let rpc = RpcClient::new(rpc_url);
+        read_onchain_rewardz_root(&rpc, &program_id)
+    })
+    .await
+    .map_err(|e| {
+        error!("spawn_blocking failed: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Internal server error".to_string(),
+            }),
+        )
+    })?
+    .map_err(|e| {
+        // Transient RPC errors must NOT be collapsed into "proof not
+        // available" — clients would retry against a still-unavailable
+        // endpoint. 503 signals "try again later".
+        warn!("RewardzRoot RPC read failed: {e}");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("Could not read on-chain RewardzRoot: {e}"),
+            }),
+        )
+    })?;
+
+    let (onchain_root, onchain_epoch) = match onchain {
+        Some(v) => v,
+        None => {
+            // Account truly not initialised — publisher hasn't run yet
+            // or is still on its first tick. Not a caller error.
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "RewardzRoot not yet initialised on-chain".to_string(),
+                }),
+            ));
+        }
+    };
+
+    // 3. Fetch current earnings — same SQL as the publisher so the
+    //    rebuilt root can match byte-for-byte.
+    let rows = db::get_rewardz_earnings_grouped(&state.pool)
+        .await
+        .map_err(|e| {
+            error!("DB error fetching rewardz earnings: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Database error".to_string(),
+                }),
+            )
+        })?;
+
+    // Apply the exact same filter as `rewardz_publisher.rs` — a row
+    // with a malformed pubkey or non-positive amount cannot be in the
+    // tree, and a divergence here would silently produce a root
+    // mismatch that looks like "503, try again" forever.
+    let entries: Vec<(Pubkey, u64)> = rows
+        .iter()
+        .filter_map(|r| {
+            let pk = Pubkey::from_str(&r.protocol_authority).ok()?;
+            if r.cumulative_amount <= 0 {
+                return None;
+            }
+            Some((pk, r.cumulative_amount as u64))
+        })
+        .collect();
+
+    // 4. Build the tree. `None` means zero entries after filter — the
+    //    response depends on whether the chain also holds the zero
+    //    root (§Q3 liveness) or a real root (state divergence, e.g.
+    //    DB wipe after publish). Distinguishing these is the job of
+    //    the divergence check below.
+    let tree = build_rewardz_tree(&entries);
+    let zero_onchain_root = onchain_root == [0u8; 32];
+
+    // 5. State-match check. Covers three cases atomically:
+    //    - Zero on-chain root + empty tree → 404 (stable liveness).
+    //    - Zero on-chain root + non-empty tree → 503 (publisher behind).
+    //    - Non-zero on-chain root + empty tree → 503 (divergence —
+    //      DB wipe after publish is the motivating case).
+    //    - Non-zero on-chain root + tree.root != onchain → 503
+    //      (new earnings since last publish).
+    // Task 35 will close the 503 windows by persisting proofs at
+    // publish time.
+    let tree = match (tree, zero_onchain_root) {
+        (None, true) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "No rewardz earnings recorded yet".to_string(),
+                }),
+            ));
+        }
+        (None, false) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Keeper state diverged from chain — DB empty but on-chain root is non-zero".to_string(),
+                }),
+            ));
+        }
+        (Some(t), _) => t,
+    };
+
+    if tree.root != onchain_root {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Keeper has unpublished earnings — retry after next publish".to_string(),
+            }),
+        ));
+    }
+
+    // 6. Find the target authority's leaf + proof. Build a HashMap of
+    //    cumulative amounts from `entries` so lookup is O(1) alongside
+    //    the O(1) proof lookup — the tree's entry set can grow with
+    //    the protocol cohort over time. Absence means the authority
+    //    genuinely has no cumulative earnings.
+    let amounts: std::collections::HashMap<Pubkey, u64> = entries.into_iter().collect();
+    let cumulative_amount = amounts.get(&target).copied();
+    let proof = tree.proofs.get(&target);
+
+    let (cumulative_amount, proof) = match (cumulative_amount, proof) {
+        (Some(a), Some(p)) => (a, p),
+        _ => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("No rewardz earnings for authority {authority_str}"),
+                }),
+            ));
+        }
+    };
+
+    // 7. Assemble response. Hex encode with `0x` prefix to match the
+    //    design-note example + existing SDK conventions.
+    let proof_hex: Vec<String> = proof
+        .iter()
+        .map(|h| format!("0x{}", crate::hex::encode(h)))
+        .collect();
+    let root_hex = format!("0x{}", crate::hex::encode(&onchain_root));
+
+    let valid_until =
+        chrono::Utc::now() + chrono::Duration::seconds(state.rewardz_publish_interval_secs);
+
+    Ok(Json(RewardzProofResponse {
+        cumulative_amount,
+        epoch: onchain_epoch,
+        proof: proof_hex,
+        root: root_hex,
+        valid_until_next_publish_at: valid_until.to_rfc3339(),
     }))
 }
 
