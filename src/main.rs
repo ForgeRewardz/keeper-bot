@@ -23,8 +23,9 @@ mod subscriptions;
 mod visibility_tick;
 
 use clap::{Parser, Subcommand};
+use std::process::ExitCode;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(name = "mvp-keeper-bot")]
@@ -45,10 +46,13 @@ enum Command {
     /// Print the resolved LeagueConfig as JSON to stdout and exit.
     /// Used by the TS ↔ Rust parity test. Respects SOLANA_NETWORK.
     PrintLeagueConfig,
+    /// Run a single start_round attempt (synchronous, for use by setup.sh).
+    /// Leverages the task 52a idempotency guard — safe to re-run.
+    StartRound,
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Full);
 
@@ -56,7 +60,7 @@ async fn main() {
     // Skip tracing init and all config/DB work here.
     if let Command::PrintLeagueConfig = command {
         println!("{}", league_config::dump_json());
-        return;
+        return ExitCode::SUCCESS;
     }
 
     // Initialize tracing for long-running modes only.
@@ -66,6 +70,35 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // One-shot `start-round` must not require a DB pool — setup.sh runs
+    // this after on-chain init but before the keeper's long-running
+    // services are up. Load config + keypair only, invoke the wrapper,
+    // and exit with an explicit code so setup.sh can gate on it.
+    if let Command::StartRound = command {
+        let (config, keypair) = config::load();
+        info!(
+            "Loaded configuration, program_id={}; running one-shot start_round",
+            config.program_id
+        );
+        return match game_loop::run_start_round_once(&config, &keypair) {
+            Ok(game_loop::StartRoundOutcome::Submitted(sig)) => {
+                info!("Submitted start_round, tx={sig}");
+                println!("start_round submitted: {sig}");
+                ExitCode::SUCCESS
+            }
+            Ok(game_loop::StartRoundOutcome::Skipped { round_id }) => {
+                info!("start_round skipped: round {round_id} already active");
+                println!("start_round skipped: round {round_id} already active");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!("start_round failed: {e}");
+                eprintln!("start_round failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // Load configuration.
     let (config, keypair) = config::load();
@@ -100,7 +133,10 @@ async fn main() {
             run_api(&config, &pool, keypair.clone()).await;
         }
         Command::PrintLeagueConfig => unreachable!("handled before config load"),
+        Command::StartRound => unreachable!("handled before DB pool creation"),
     }
+
+    ExitCode::SUCCESS
 }
 
 async fn run_api(

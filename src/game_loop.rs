@@ -232,7 +232,7 @@ fn should_skip_start_round(round_state: Option<&GameRoundState>) -> bool {
 /// in each case so operators can distinguish bootstrap races from
 /// genuine round openings.
 #[derive(Debug)]
-enum StartRoundOutcome {
+pub enum StartRoundOutcome {
     Submitted(Signature),
     Skipped { round_id: u64 },
 }
@@ -344,6 +344,23 @@ fn settle_round(
         data: vec![IX_SETTLE_ROUND],
     };
     send_instruction(rpc, keypair, ix)
+}
+
+/// One-shot synchronous entry point for `setup.sh` to trigger the very
+/// first `start_round` at the end of bootstrap. Leverages the task 52a
+/// idempotency guard via `start_round`, so repeated invocations are safe
+/// no-ops if a round is already active. Returns an error if the
+/// GameConfig PDA has not yet been initialised — the caller is expected
+/// to run `cli initialize-game` first.
+pub fn run_start_round_once(
+    config: &crate::config::Config,
+    keypair: &Keypair,
+) -> Result<StartRoundOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    let rpc = RpcClient::new(config.solana_rpc_url.clone());
+    let game_config = load_game_config(&rpc, &config.program_id)?.ok_or(
+        "GameConfig PDA not initialised — run `cli initialize-game` first",
+    )?;
+    start_round(&rpc, keypair, &config.program_id, &game_config)
 }
 
 /// One tick of the game loop. Performs AT MOST one on-chain state
