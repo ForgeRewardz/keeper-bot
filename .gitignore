@@ -1,3 +1,7 @@
 .DS_Store
 target
 test-ledger
+
+# Environment files — generated from mobileSpecs/.env.shared; never commit real values
+.env
+.env.local

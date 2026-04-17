@@ -2,6 +2,19 @@
 
 Off-chain keeper service for the REWARDZ protocol. Publishes Merkle roots on-chain, signs point-sync receipts, settles rentals, executes subscriptions, and cranks the mining game loop.
 
+## Local dev
+
+Part of the REWARDZ `mobileSpecs/` stack. For the full local setup (shared env, docker compose, 22 env vars), see [`../LOCAL-SETUP.md`](../LOCAL-SETUP.md).
+
+Quick path (from mobileSpecs/ root):
+
+```bash
+./scripts/bootstrap-local.sh           # brings up keeper via docker compose --profile core
+docker logs -f rewardz-keeper | grep round   # watch the game loop crank
+```
+
+See `.env.example` for the full 22-variable config matrix (matches `src/config.rs`).
+
 ## Architecture
 
 The keeper bot runs as a single binary with three modes:
