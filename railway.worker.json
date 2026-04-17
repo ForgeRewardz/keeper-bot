@@ -1,0 +1,15 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "_comment": "Keeper run-crons service (background worker). No HTTP port, no healthcheck. Same Docker image as railway.json (serve-api); different Start Command. Deploy as a second Railway service and point both at the same image build.",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "startCommand": "/entrypoint.sh run-crons",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5,
+    "numReplicas": 1,
+    "sleepApplication": false
+  }
+}
