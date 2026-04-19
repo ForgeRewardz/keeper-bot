@@ -253,10 +253,16 @@ pub const MAINNET: LeagueConfig = LeagueConfig {
 };
 
 pub fn load_league_config() -> LeagueConfig {
+    // `localnet` reuses the devnet preset (standard practice for local
+    // iteration — matches setup.sh's LEAGUE_NETWORK mapping). `mainnet-beta`
+    // is accepted as an alias for `mainnet` because that's the canonical
+    // cluster label in .env.shared / Solana CLI config.
     match std::env::var("SOLANA_NETWORK").as_deref() {
-        Ok("devnet") => DEVNET,
-        Ok("mainnet") => MAINNET,
-        other => panic!("Unknown SOLANA_NETWORK: {other:?}"),
+        Ok("devnet") | Ok("localnet") => DEVNET,
+        Ok("mainnet") | Ok("mainnet-beta") => MAINNET,
+        other => panic!(
+            "Unknown SOLANA_NETWORK: {other:?} (expected devnet|localnet|mainnet|mainnet-beta)"
+        ),
     }
 }
 

@@ -47,7 +47,7 @@ use tracing::{error, info, warn};
 const PREFIX_LEN: usize = 2;
 
 fn token_2022_program_id() -> Pubkey {
-    Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPwEGpKvp5E8dRmAr91hFq").unwrap()
+    Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap()
 }
 
 fn system_program_id() -> Pubkey {
@@ -259,6 +259,31 @@ fn start_round(
         return Ok(StartRoundOutcome::Skipped {
             round_id: next_round_id,
         });
+    }
+
+    // Second guard: if the *previous* round exists and is not yet settled,
+    // the on-chain program will reject start_round with `RoundNotSettled`
+    // (0x22). This happens when bootstrap is re-run against a cluster where
+    // a prior `start-round` landed but `full`-mode settle never followed
+    // (e.g. operator stopped the keeper, or running setup.sh twice without
+    // running `cargo run -- full` in between). Skip rather than fail so the
+    // one-shot is safely re-runnable; the operator's next `full` invocation
+    // will settle the prior round and start the next.
+    if config.current_round_id > 0 {
+        let previous_round_id = config.current_round_id;
+        let previous = load_game_round(rpc, program_id, previous_round_id)?;
+        match previous {
+            Some(round) if !round.settled => {
+                info!(
+                    "start_round skipped: previous round {previous_round_id} unsettled — \
+                     run `mvp-keeper-bot full` to settle then advance"
+                );
+                return Ok(StartRoundOutcome::Skipped {
+                    round_id: next_round_id,
+                });
+            }
+            _ => {}
+        }
     }
 
     let sig = submit_start_round(rpc, keypair, program_id, config, next_round_id)?;

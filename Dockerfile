@@ -3,6 +3,13 @@
 # =============================================================================
 # mvp-keeper-bot — multi-stage build with cargo-chef + BuildKit cache mounts
 # =============================================================================
+# Build context: mobileSpecs/ root (set in docker-compose.yml).
+# Reason: mvp-keeper-bot/Cargo.toml has a path dep on the on-chain API crate:
+#     rewardz-mvp-api = { path = "../mvp-smart-contracts/api" }
+# A per-service context can't see ../mvp-smart-contracts, so cargo errors with
+# `error: failed to load manifest for dependency`. Lifting the context to the
+# monorepo root lets us COPY the sibling crate at the expected relative path.
+#
 # Builds the REWARDZ keeper-bot Rust binary using the cargo-chef pattern for
 # fast incremental rebuilds on CI/Railway:
 #
@@ -14,47 +21,55 @@
 # The `--mount=type=cache` directives preserve cargo's registry/git/target
 # across builds so a cold Railway rebuild only recompiles changed code,
 # not the full Solana dep tree. Trims typical rebuild from ~15min to ~2min.
-#
-# Build locally with: DOCKER_BUILDKIT=1 docker build -t rewardz-keeper .
 # =============================================================================
 
-FROM rust:1.82-alpine AS chef
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev bash
+FROM rust:1.89-alpine AS chef
+# openssl-libs-static is mandatory for musl static linking — the openssl-sys
+# crate (transitively pulled in by reqwest/native-tls) needs both the headers
+# (openssl-dev) and the static archives (openssl-libs-static), otherwise the
+# final link fails with `cannot find -lssl / -lcrypto` against alpine musl.
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static bash
 RUN cargo install cargo-chef --locked --version 0.1.68
-WORKDIR /app
+WORKDIR /app/mvp-keeper-bot
 
 # ---- planner: capture the dep graph only ----
+# Layout the workspace such that ../mvp-smart-contracts/api resolves
+# correctly (matches host layout exactly).
 FROM chef AS planner
-COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
+COPY mvp-smart-contracts/Cargo.toml mvp-smart-contracts/Cargo.lock /app/mvp-smart-contracts/
+COPY mvp-smart-contracts/api/ /app/mvp-smart-contracts/api/
+COPY mvp-smart-contracts/program/ /app/mvp-smart-contracts/program/
+COPY mvp-smart-contracts/cli/ /app/mvp-smart-contracts/cli/
+COPY mvp-keeper-bot/Cargo.toml mvp-keeper-bot/Cargo.lock ./
+COPY mvp-keeper-bot/src/ src/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ---- builder: cook deps (cached), then build the actual binary ----
 FROM chef AS builder
-COPY --from=planner /app/recipe.json recipe.json
-# Cook: build only dependencies, not the workspace crates.
-# BuildKit cache mounts persist across builds on the same runner.
+# Sibling crate must be present BEFORE cook because the recipe references it.
+COPY mvp-smart-contracts/Cargo.toml mvp-smart-contracts/Cargo.lock /app/mvp-smart-contracts/
+COPY mvp-smart-contracts/api/ /app/mvp-smart-contracts/api/
+COPY mvp-smart-contracts/program/ /app/mvp-smart-contracts/program/
+COPY mvp-smart-contracts/cli/ /app/mvp-smart-contracts/cli/
+COPY --from=planner /app/mvp-keeper-bot/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
+    --mount=type=cache,target=/app/mvp-keeper-bot/target \
     cargo chef cook --release --recipe-path recipe.json
 
-COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
+COPY mvp-keeper-bot/Cargo.toml mvp-keeper-bot/Cargo.lock ./
+COPY mvp-keeper-bot/src/ src/
 
-# Final build. Cache mounts give us: registry + git + target dir.
-# After build, copy the binary OUT of the cached target dir so it
-# survives into the next stage (cache mounts aren't preserved in layers).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
+    --mount=type=cache,target=/app/mvp-keeper-bot/target \
     cargo build --release && \
     cp target/release/mvp-keeper-bot /mvp-keeper-bot
 
 # ---- runtime: minimal alpine + entrypoint for KEYPAIR_BASE64 decode ----
 FROM alpine:3.20 AS runtime
 RUN apk add --no-cache ca-certificates bash
-COPY scripts/entrypoint.sh /entrypoint.sh
+COPY mvp-keeper-bot/scripts/entrypoint.sh /entrypoint.sh
 COPY --from=builder /mvp-keeper-bot /usr/local/bin/
 RUN chmod +x /entrypoint.sh
 

@@ -5,3 +5,7 @@ test-ledger
 # Environment files — generated from mobileSpecs/.env.shared; never commit real values
 .env
 .env.local
+
+# Claude
+.claude
+CLAUDE.md
